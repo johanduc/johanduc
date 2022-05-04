@@ -1,0 +1,158 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Data;
+using System.Drawing;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+
+using Tekla.Structures.Model;
+using Tekla.Structures.Model.UI;
+using Tekla.Structures.Geometry3d;
+using Tekla.Structures.Solid;
+using Tekla.Structures.Filtering;
+
+using tsm = Tekla.Structures.Model;
+using tsmui = Tekla.Structures.Model.UI;
+using tsg = Tekla.Structures.Geometry3d;
+using tss = Tekla.Structures.Solid;
+using tsf = Tekla.Structures.Filtering;
+using cslib = cs_net_lib;
+
+namespace Tekla.Technology.Akit.UserScript
+{
+    public class Script
+    {
+        public static void Run(Tekla.Technology.Akit.IScript akit)
+        {
+            Model model = new Model();
+            Picker picker = new Picker();
+            try
+            {
+                if (!model.GetConnectionStatus()) return;
+                tsm.ModelObject soil = picker.PickObject(Picker.PickObjectEnum.PICK_ONE_PART, "Pick soil");
+                tsm.Part part = soil as tsm.Part;
+                //Tim nhung dummy co chua guid cua part de xoa di
+                tsf.BinaryFilterExpressionCollection expressCollection = new BinaryFilterExpressionCollection();
+                tsf.Categories.ObjectFilterExpressions.Type objectFilterExpressions = new tsf.Categories.ObjectFilterExpressions.Type();
+                tsf.NumericConstantFilterExpression numericConstantFilterExpression = new NumericConstantFilterExpression(Tekla.Structures.TeklaStructuresDatabaseTypeEnum.PART);
+                tsf.BinaryFilterExpression expression1 = new BinaryFilterExpression(objectFilterExpressions, NumericOperatorType.IS_EQUAL, numericConstantFilterExpression);
+                expressCollection.Add(new BinaryFilterExpressionItem(expression1, BinaryFilterOperatorType.BOOLEAN_AND));
+
+                tsf.Categories.PartFilterExpressions.CustomString customString = new tsf.Categories.PartFilterExpressions.CustomString("tkis_Soil");
+                tsf.StringConstantFilterExpression value = new StringConstantFilterExpression(part.Identifier.GUID.ToString());
+                tsf.BinaryFilterExpression expression = new BinaryFilterExpression(customString, StringOperatorType.IS_EQUAL, value);
+                expressCollection.Add(new BinaryFilterExpressionItem(expression));
+                tsm.ModelObjectEnumerator mObjEnum = model.GetModelObjectSelector().GetObjectsByFilter(expressCollection);
+                //MessageBox.Show(mObjEnum.GetSize().ToString());
+                while (mObjEnum.MoveNext())
+                {
+                    if (!(mObjEnum.Current is tsm.ModelObject)) continue;
+                    tsm.ModelObject mObj = mObjEnum.Current as tsm.ModelObject;
+                    mObj.Select();
+                    mObj.Delete();
+                }
+                if (mObjEnum.GetSize() > 0)
+                {
+                    MessageBox.Show("Delete old dummy");
+                }
+
+                Solid solid = part.GetSolid();
+                //Lấy điểm cao nhất của khối đất
+                tsg.Point maxPoint = solid.MaximumPoint;
+                tsg.Point minPoint = solid.MinimumPoint;
+
+                //Lấy các bề mặt của khối đất
+                //Trong trường hợp này, chỉ lấy 2 bề mặt trên và dưới của khối đất. Điểm chung là có chung tòa độ vector v = (0,0,1)
+                FaceEnumerator MyFaceEnum = solid.GetFaceEnumerator();
+                List<List<tsg.Point>> points_List = new List<List<tsg.Point>>();
+                while (MyFaceEnum.MoveNext())
+                {
+                    if (!(MyFaceEnum.Current is Face)) continue;
+                    Face MyFace = MyFaceEnum.Current as Face;
+
+                    //Lấy vector v của bề mặt khối đất
+                    //Kiểm tra chênh lệch góc của vector v và vector Z (0,0,1)
+                    //Nếu góc nghiêng là 0 hoặc 180 -> thỏa mãn -> tiến hành lấy các điểm của bề mặt này.
+                    tsg.Vector normalVector = MyFace.Normal;
+                    double angle = normalVector.GetAngleBetween(new tsg.Vector(0, 0, 1));
+                    if (Math.Abs(angle) <= 0.01 || Math.Abs(angle - Math.PI) <= 0.01 || Math.Abs(angle - Math.PI / 2) <= 0.01) continue;
+                    LoopEnumerator MyLoopEnum = MyFace.GetLoopEnumerator();
+                    while (MyLoopEnum.MoveNext())
+                    {
+                        if (!(MyLoopEnum.Current is Loop)) continue;
+                        Loop MyLoop = MyLoopEnum.Current as Loop;
+                        VertexEnumerator MyVertexEnum = MyLoop.GetVertexEnumerator() as VertexEnumerator;
+                        List<tsg.Point> points = new List<tsg.Point>();
+                        while (MyVertexEnum.MoveNext())
+                        {
+                            tsg.Point MyVertex = MyVertexEnum.Current as tsg.Point;
+
+                            if (MyVertex == null) continue;
+                            tsg.Point p = new tsg.Point(MyVertex.X, MyVertex.Y, MyVertex.Z);
+                            points.Add(p);
+                        }
+                        points_List.Add(points);
+                    }
+                }
+                
+
+                foreach (List<tsg.Point> pointList in points_List)
+                {
+                    //lay diem cao nhat theo phuong Z
+                    tsg.Point maxZ = pointList.OrderByDescending(d => d.Z).ToList()[0];
+
+                    pointList.Add(pointList[0]);
+                    bool a = cslib.PolygonOperation.GetPolygonOrientation(pointList);
+                    if (a == false) pointList.Reverse();
+                    for (int i = 0; i < pointList.Count - 1; i++)
+                    {
+                        tsg.Point p1 = pointList[i];
+                        tsg.Point p2 = pointList[i + 1];
+
+                        if (Math.Abs(p1.Z - maxZ.Z) < 3 && Math.Abs(p2.Z - maxZ.Z) < 3)
+                        {
+                            Create_Beam(p1, p2, "PLT10*250", part);
+                            Create_Beam(p1, p2, "PLT10*500", part);
+                        }
+                    }
+                }
+                model.CommitChanges();
+                MessageBox.Show("Done!");
+            }
+            catch (Exception)
+            {
+
+            }
+        }
+        private void Insert_ControlPoint(tsg.Point point)
+        {
+            tsm.ControlPoint cp = new ControlPoint(point);
+            cp.Insert();
+        }
+
+        private void Create_Beam(tsg.Point p1, tsg.Point p2, string Profile, tsm.Part part)
+        {
+            tsm.Beam beam = new Beam(p1, p2);
+            beam.Profile.ProfileString = Profile;
+            beam.Material.MaterialString = "Misc_Undefined";
+            beam.Class = "2";
+            beam.Name = "DUMMY_EXCAVATION-BORD";
+            beam.AssemblyNumber.Prefix = "X";
+            beam.PartNumber.Prefix = "X";
+
+            beam.Position.Plane = Position.PlaneEnum.RIGHT;
+            beam.Position.Rotation = Position.RotationEnum.BACK;
+            beam.Position.Depth = Position.DepthEnum.BEHIND;
+
+            beam.Position.PlaneOffset = 2;
+            beam.StartPointOffset.Dx = 2;
+            beam.EndPointOffset.Dx = -2;
+
+            beam.Insert();
+            beam.SetUserProperty("tkis_Soil", part.Identifier.GUID.ToString());
+        }
+    }
